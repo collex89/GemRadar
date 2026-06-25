@@ -17,7 +17,7 @@ import time
 import html
 import logging
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
@@ -366,7 +366,9 @@ def start_health_server() -> None:
     the monitor.
     """
     try:
-        server = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
+        # Threaded so concurrent pings / health probes never get dropped
+        # (a single-threaded server makes Render's proxy return sporadic 404s).
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), _HealthHandler)
         log.info("Health server listening on port %s", PORT)
         server.serve_forever()
     except Exception as exc:  # noqa: BLE001
