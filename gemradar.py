@@ -59,6 +59,14 @@ MIN_LIQUIDITY_USD = 10_000
 # rather receive every qualifying token and just see the Telegram line blank.
 REQUIRE_TELEGRAM = True
 
+# If True, on startup the bot silently records every token currently in the
+# DexScreener feed as "already seen" WITHOUT alerting, then only alerts tokens
+# that appear afterwards. This stops a restart/redeploy from re-announcing the
+# same tokens (the "seen" list lives in memory and resets on every restart).
+# Set to False if you'd rather get an alert for whatever is already listed when
+# the bot boots.
+SEED_ON_STARTUP = True
+
 # DexScreener endpoints.
 PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
@@ -289,6 +297,22 @@ def enrich_token(chain: str, address: str, profile_links=None) -> dict | None:
     }
 
 
+def seed_seen_tokens() -> int:
+    """Mark everything currently in the feed as seen, without alerting.
+
+    Called once at startup so a restart/redeploy doesn't re-announce tokens
+    that were already listed. Returns how many tokens were seeded.
+    """
+    seeded = 0
+    for profile in fetch_latest_profiles():
+        chain = profile.get("chainId")
+        address = profile.get("tokenAddress")
+        if chain in ALLOWED_CHAINS and address:
+            seen_tokens.add(f"{chain}:{address}")
+            seeded += 1
+    return seeded
+
+
 def check_for_new_tokens() -> None:
     """One polling pass: fetch profiles, filter, and alert on new qualifiers."""
     profiles = fetch_latest_profiles()
@@ -389,12 +413,27 @@ def main() -> None:
     # Start the health server first so the host detects an open port quickly.
     threading.Thread(target=start_health_server, daemon=True).start()
 
+    # Seed already-listed tokens so a restart doesn't re-announce them.
+    seeded = 0
+    if SEED_ON_STARTUP:
+        seeded = seed_seen_tokens()
+        log.info(
+            "Seeded %s currently-listed tokens; only NEW tokens will alert.",
+            seeded,
+        )
+
     # Startup confirmation so you know the bot is alive.
+    seed_line = (
+        f"Seeded {seeded} existing tokens; watching for new ones\n"
+        if SEED_ON_STARTUP
+        else ""
+    )
     startup_ok = send_telegram(
         "✅ <b>GemRadar is online</b>\n\n"
         f"Monitoring: {', '.join(CHAIN_LABELS[c] for c in CHAIN_LABELS)}\n"
         f"Min liquidity: ${MIN_LIQUIDITY_USD:,}\n"
         f"Telegram required: {'yes' if REQUIRE_TELEGRAM else 'no'}\n"
+        f"{seed_line}"
         f"Poll interval: {POLL_INTERVAL}s"
     )
     if startup_ok:
