@@ -4,7 +4,11 @@ GemRadar - DexScreener new-token monitor with Telegram alerts.
 
 Polls DexScreener for newly listed token profiles, filters them by chain and
 liquidity, and pushes a formatted alert to a Telegram chat. Designed to run
-forever as a single long-lived process (e.g. on Railway.app).
+forever as a single long-lived process (e.g. on Render, Railway, or a VM).
+
+It also runs a tiny HTTP health server so it can be deployed on hosts whose
+free tier only offers web services (like Render) and so an uptime pinger can
+keep the instance from sleeping.
 """
 
 import os
@@ -12,6 +16,8 @@ import sys
 import time
 import html
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 
@@ -60,6 +66,12 @@ TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 # Network timeout (seconds) for every outbound HTTP request.
 REQUEST_TIMEOUT = 15
 
+# Port for the built-in health-check web server. Hosts like Render inject a
+# $PORT environment variable and require the service to listen on it, otherwise
+# the deploy is marked failed ("no open ports detected"). Locally it defaults
+# to 8080. An uptime pinger hitting this port keeps a free instance awake.
+PORT = int(os.getenv("PORT", "8080"))
+
 # Pretty chain labels for the alert message.
 CHAIN_LABELS = {
     "ethereum": "Ethereum",
@@ -84,11 +96,12 @@ seen_tokens = set()
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
-def send_telegram(message: str) -> bool:
+def send_telegram(message: str, retries: int = 3) -> bool:
     """Send an HTML-formatted message to the configured Telegram chat.
 
-    Returns True on success, False on failure. Never raises so a Telegram
-    hiccup can't crash the monitor loop.
+    Retries a few times on transient network errors (timeouts, dropped
+    connections). Returns True on success, False on failure. Never raises so a
+    Telegram hiccup can't crash the monitor loop.
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -97,15 +110,23 @@ def send_telegram(message: str) -> bool:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    try:
-        resp = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            return True
-        log.error("Telegram API returned %s: %s", resp.status_code, resp.text[:300])
-        return False
-    except requests.RequestException as exc:
-        log.error("Failed to send Telegram message: %s", exc)
-        return False
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                return True
+            # A non-200 is an API-level rejection (e.g. bad chat id); retrying
+            # won't help, so report and stop.
+            log.error("Telegram API returned %s: %s", resp.status_code, resp.text[:300])
+            return False
+        except requests.RequestException as exc:
+            log.warning(
+                "Telegram send attempt %s/%s failed: %s", attempt, retries, exc
+            )
+            if attempt < retries:
+                time.sleep(2)
+    log.error("Giving up on Telegram message after %s attempts.", retries)
+    return False
 
 
 def extract_socials(items) -> dict:
@@ -318,6 +339,41 @@ def check_for_new_tokens() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Health-check web server (keeps free web-service hosts happy / awake)
+# ---------------------------------------------------------------------------
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"GemRadar is running.")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        # Silence the default per-request stderr logging (pingers are noisy).
+        pass
+
+
+def start_health_server() -> None:
+    """Serve a minimal HTTP endpoint on PORT in a background thread.
+
+    Required by hosts (e.g. Render) that only offer free *web* services and
+    expect an open port. Also the URL an uptime pinger hits to prevent the
+    free instance from sleeping. Any failure here is logged but never crashes
+    the monitor.
+    """
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
+        log.info("Health server listening on port %s", PORT)
+        server.serve_forever()
+    except Exception as exc:  # noqa: BLE001
+        log.error("Health server stopped: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -327,6 +383,9 @@ def main() -> None:
             "(as environment variables)."
         )
         sys.exit(1)
+
+    # Start the health server first so the host detects an open port quickly.
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     # Startup confirmation so you know the bot is alive.
     startup_ok = send_telegram(

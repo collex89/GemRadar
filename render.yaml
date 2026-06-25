@@ -1,0 +1,17 @@
+# Render Blueprint for GemRadar.
+# In the Render dashboard: New + -> Blueprint -> connect this repo.
+# Render will create a free web service and prompt you for the two secrets.
+services:
+  - type: web
+    name: gemradar
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python gemradar.py
+    envVars:
+      # sync: false => Render prompts you to enter these in the dashboard and
+      # never stores them in the repo. Fill in your real values there.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
